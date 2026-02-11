@@ -272,7 +272,7 @@ function renderGroupedMessage(
       }
       ${
         markdown
-          ? role === "user"
+          ? role.toLowerCase() === "user"
             ? html`<div class="chat-text">${unsafeHTML(escapeHtml(markdown).replace(/\n/g, "<br>"))}</div>`
             : html`<div class="chat-text">${unsafeHTML(toSanitizedMarkdownHtml(markdown))}</div>`
           : nothing
