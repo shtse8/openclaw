@@ -12,6 +12,70 @@ import { randomUUID } from "node:crypto";
 
 export const OLLAMA_NATIVE_BASE_URL = "http://127.0.0.1:11434";
 
+// ── Ollama tool-support detection cache ─────────────────────────────────────
+
+/**
+ * Module-level cache for Ollama model tool support.
+ * Key: `${baseUrl}::${modelId}`, Value: resolved boolean promise.
+ */
+const toolSupportCache = new Map<string, Promise<boolean>>();
+
+/**
+ * Check whether an Ollama model supports tool calling by inspecting its
+ * template via the `/api/show` endpoint. Models whose Go template contains
+ * a `.Tools` reference (e.g. `{{- if .Tools }}`) are considered tool-capable.
+ *
+ * Results are cached per (baseUrl, modelId) pair for the process lifetime.
+ * On network errors or missing endpoints the function defaults to `true`
+ * so existing behaviour is preserved.
+ */
+export function checkOllamaToolSupport(
+  baseUrl: string,
+  modelId: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<boolean> {
+  const cacheKey = `${baseUrl}::${modelId}`;
+  const cached = toolSupportCache.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
+
+  const promise = (async (): Promise<boolean> => {
+    try {
+      const showUrl = `${baseUrl.replace(/\/+$/, "")}/api/show`;
+      const res = await fetchImpl(showUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: modelId }),
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!res.ok) {
+        // Cannot determine — assume tools are supported (preserve existing behaviour).
+        return true;
+      }
+      const data = (await res.json()) as { template?: string };
+      if (typeof data.template !== "string") {
+        return true;
+      }
+      // Ollama templates reference `.Tools` when the model supports tool calling.
+      return data.template.includes(".Tools");
+    } catch {
+      // Network error / timeout — default to true.
+      return true;
+    }
+  })();
+
+  toolSupportCache.set(cacheKey, promise);
+  return promise;
+}
+
+/**
+ * Clear the tool-support cache. Exported for testing.
+ */
+export function clearToolSupportCache(): void {
+  toolSupportCache.clear();
+}
+
 // ── Ollama /api/chat request types ──────────────────────────────────────────
 
 interface OllamaChatRequest {
@@ -284,6 +348,8 @@ function resolveOllamaChatUrl(baseUrl: string): string {
 
 export function createOllamaStreamFn(baseUrl: string): StreamFn {
   const chatUrl = resolveOllamaChatUrl(baseUrl);
+  // Derive the Ollama API base (without /api/chat) for tool-support checks.
+  const apiBase = chatUrl.replace(/\/api\/chat$/, "");
 
   return (model, context, options) => {
     const stream = createAssistantMessageEventStream();
@@ -295,7 +361,20 @@ export function createOllamaStreamFn(baseUrl: string): StreamFn {
           context.systemPrompt,
         );
 
-        const ollamaTools = extractOllamaTools(context.tools);
+        let ollamaTools = extractOllamaTools(context.tools);
+
+        // Check whether this model actually supports tool calling.
+        // Models without tool support silently return empty responses when
+        // tools are included in the request (#15702).
+        if (ollamaTools.length > 0) {
+          const supportsTools = await checkOllamaToolSupport(apiBase, model.id);
+          if (!supportsTools) {
+            console.warn(
+              `[ollama-stream] Model "${model.id}" does not support tools — omitting tools from request`,
+            );
+            ollamaTools = [];
+          }
+        }
 
         // Ollama defaults to num_ctx=4096 which is too small for large
         // system prompts + many tool definitions. Use model's contextWindow.
@@ -375,6 +454,21 @@ export function createOllamaStreamFn(baseUrl: string): StreamFn {
           provider: model.provider,
           id: model.id,
         });
+
+        // Surface empty responses as errors instead of silently returning
+        // "(no output)" to the user (#15702).
+        if (
+          assistantMessage.content.length === 0 ||
+          (assistantMessage.content.length === 1 &&
+            assistantMessage.content[0].type === "text" &&
+            !assistantMessage.content[0].text.trim())
+        ) {
+          throw new Error(
+            `Ollama model "${model.id}" returned an empty response. ` +
+              `This may indicate the model does not support the requested operation. ` +
+              `Try a different model or check Ollama server logs for details.`,
+          );
+        }
 
         const reason: Extract<StopReason, "stop" | "length" | "toolUse"> =
           assistantMessage.stopReason === "toolUse" ? "toolUse" : "stop";

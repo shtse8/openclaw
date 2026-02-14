@@ -1,9 +1,11 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi, beforeEach } from "vitest";
 import {
   createOllamaStreamFn,
   convertToOllamaMessages,
   buildAssistantMessage,
   parseNdjsonStream,
+  checkOllamaToolSupport,
+  clearToolSupportCache,
 } from "./ollama-stream.js";
 
 describe("convertToOllamaMessages", () => {
@@ -231,6 +233,10 @@ describe("parseNdjsonStream", () => {
 });
 
 describe("createOllamaStreamFn", () => {
+  beforeEach(() => {
+    clearToolSupportCache();
+  });
+
   it("normalizes /v1 baseUrl and maps maxTokens + signal", async () => {
     const originalFetch = globalThis.fetch;
     const fetchMock = vi.fn(async () => {
@@ -286,5 +292,268 @@ describe("createOllamaStreamFn", () => {
     } finally {
       globalThis.fetch = originalFetch;
     }
+  });
+
+  it("omits tools when model does not support them", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async (url: string, _init?: RequestInit) => {
+      const urlStr = typeof url === "string" ? url : String(url);
+      // /api/show → model template without .Tools
+      if (urlStr.includes("/api/show")) {
+        return new Response(JSON.stringify({ template: "{{ .Prompt }}" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      // /api/chat → normal response
+      const payload = [
+        '{"model":"m","created_at":"t","message":{"role":"assistant","content":"I can help"},"done":false}',
+        '{"model":"m","created_at":"t","message":{"role":"assistant","content":""},"done":true,"prompt_eval_count":5,"eval_count":3}',
+      ].join("\n");
+      return new Response(`${payload}\n`, {
+        status: 200,
+        headers: { "Content-Type": "application/x-ndjson" },
+      });
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    try {
+      const streamFn = createOllamaStreamFn("http://localhost:11434");
+      const stream = streamFn(
+        {
+          id: "deepseek-coder-v2:16b-lite-instruct-q4_K_M",
+          api: "ollama",
+          provider: "ollama",
+          contextWindow: 32768,
+        } as unknown as Parameters<typeof streamFn>[0],
+        {
+          messages: [{ role: "user", content: "hello" }],
+          tools: [{ name: "bash", description: "Run a command", parameters: {} }],
+        } as unknown as Parameters<typeof streamFn>[1],
+        {} as unknown as Parameters<typeof streamFn>[2],
+      );
+
+      const events = [];
+      for await (const event of stream) {
+        events.push(event);
+      }
+      expect(events.at(-1)?.type).toBe("done");
+
+      // Find the /api/chat call
+      const chatCall = fetchMock.mock.calls.find(
+        (call) => typeof call[0] === "string" && call[0].includes("/api/chat"),
+      );
+      expect(chatCall).toBeTruthy();
+      const chatBody = JSON.parse((chatCall![1] as RequestInit).body as string) as {
+        tools?: unknown[];
+      };
+      // Tools should be omitted because the model doesn't support them
+      expect(chatBody.tools).toBeUndefined();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("includes tools when model supports them", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async (url: string) => {
+      const urlStr = typeof url === "string" ? url : String(url);
+      if (urlStr.includes("/api/show")) {
+        return new Response(
+          JSON.stringify({
+            template: "{{- if .Tools }}{{ .Tools }}{{- end }}{{ .System }}{{ .Prompt }}",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      const payload = [
+        '{"model":"m","created_at":"t","message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"bash","arguments":{"command":"ls"}}}]},"done":false}',
+        '{"model":"m","created_at":"t","message":{"role":"assistant","content":""},"done":true,"prompt_eval_count":5,"eval_count":3}',
+      ].join("\n");
+      return new Response(`${payload}\n`, {
+        status: 200,
+        headers: { "Content-Type": "application/x-ndjson" },
+      });
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    try {
+      const streamFn = createOllamaStreamFn("http://localhost:11434");
+      const stream = streamFn(
+        {
+          id: "qwen3:32b",
+          api: "ollama",
+          provider: "ollama",
+          contextWindow: 131072,
+        } as unknown as Parameters<typeof streamFn>[0],
+        {
+          messages: [{ role: "user", content: "hello" }],
+          tools: [{ name: "bash", description: "Run a command", parameters: {} }],
+        } as unknown as Parameters<typeof streamFn>[1],
+        {} as unknown as Parameters<typeof streamFn>[2],
+      );
+
+      const events = [];
+      for await (const event of stream) {
+        events.push(event);
+      }
+      expect(events.at(-1)?.type).toBe("done");
+
+      const chatCall = fetchMock.mock.calls.find(
+        (call) => typeof call[0] === "string" && call[0].includes("/api/chat"),
+      );
+      expect(chatCall).toBeTruthy();
+      const chatBody = JSON.parse((chatCall![1] as RequestInit).body as string) as {
+        tools?: unknown[];
+      };
+      // Tools should be included because the model supports them
+      expect(chatBody.tools).toBeDefined();
+      expect(chatBody.tools).toHaveLength(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("surfaces empty response as an error", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async () => {
+      // Model returns completely empty content
+      const payload =
+        '{"model":"m","created_at":"t","message":{"role":"assistant","content":""},"done":true,"prompt_eval_count":5,"eval_count":0}';
+      return new Response(`${payload}\n`, {
+        status: 200,
+        headers: { "Content-Type": "application/x-ndjson" },
+      });
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    try {
+      const streamFn = createOllamaStreamFn("http://localhost:11434");
+      const stream = streamFn(
+        {
+          id: "broken-model",
+          api: "ollama",
+          provider: "ollama",
+          contextWindow: 4096,
+        } as unknown as Parameters<typeof streamFn>[0],
+        {
+          messages: [{ role: "user", content: "hello" }],
+        } as unknown as Parameters<typeof streamFn>[1],
+        {} as unknown as Parameters<typeof streamFn>[2],
+      );
+
+      const events = [];
+      for await (const event of stream) {
+        events.push(event);
+      }
+
+      const lastEvent = events.at(-1);
+      expect(lastEvent?.type).toBe("error");
+      if (lastEvent?.type === "error") {
+        expect(lastEvent.error.errorMessage).toContain("empty response");
+        expect(lastEvent.error.errorMessage).toContain("broken-model");
+      }
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+describe("checkOllamaToolSupport", () => {
+  beforeEach(() => {
+    clearToolSupportCache();
+  });
+
+  it("returns true when template contains .Tools", async () => {
+    const mockFetch = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            template: "{{- if .Tools }}{{ .Tools }}{{- end }}{{ .System }}{{ .Prompt }}",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+    );
+    const result = await checkOllamaToolSupport(
+      "http://localhost:11434",
+      "qwen3:32b",
+      mockFetch as unknown as typeof fetch,
+    );
+    expect(result).toBe(true);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns false when template does not contain .Tools", async () => {
+    const mockFetch = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            template: "{{ .System }}\n{{ .Prompt }}",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+    );
+    const result = await checkOllamaToolSupport(
+      "http://localhost:11434",
+      "deepseek-coder-v2:16b-lite-instruct-q4_K_M",
+      mockFetch as unknown as typeof fetch,
+    );
+    expect(result).toBe(false);
+  });
+
+  it("returns true when /api/show fails (preserve existing behavior)", async () => {
+    const mockFetch = vi.fn(async () => new Response("not found", { status: 404 }));
+    const result = await checkOllamaToolSupport(
+      "http://localhost:11434",
+      "some-model",
+      mockFetch as unknown as typeof fetch,
+    );
+    expect(result).toBe(true);
+  });
+
+  it("returns true on network error (preserve existing behavior)", async () => {
+    const mockFetch = vi.fn(async () => {
+      throw new Error("ECONNREFUSED");
+    });
+    const result = await checkOllamaToolSupport(
+      "http://localhost:11434",
+      "some-model",
+      mockFetch as unknown as typeof fetch,
+    );
+    expect(result).toBe(true);
+  });
+
+  it("caches results per (baseUrl, modelId)", async () => {
+    const mockFetch = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ template: "{{ .Prompt }}" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+    );
+    const fetchTyped = mockFetch as unknown as typeof fetch;
+
+    const result1 = await checkOllamaToolSupport("http://localhost:11434", "model-a", fetchTyped);
+    const result2 = await checkOllamaToolSupport("http://localhost:11434", "model-a", fetchTyped);
+    expect(result1).toBe(false);
+    expect(result2).toBe(false);
+    // Should only have called fetch once due to caching
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns true when template field is missing", async () => {
+    const mockFetch = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ modelfile: "FROM llama3" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+    );
+    const result = await checkOllamaToolSupport(
+      "http://localhost:11434",
+      "model-x",
+      mockFetch as unknown as typeof fetch,
+    );
+    expect(result).toBe(true);
   });
 });
